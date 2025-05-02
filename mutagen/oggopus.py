@@ -113,14 +113,14 @@ def _get_opus_stream_size(f):
 
 
 def _opus_bitrate(fileobj, length: int) -> int:
-    '''Calculate the bitrate of an opus file.
+    '''Calculate the bitrate (bit/s) of an opus file.
 
     :param fileobj: object of an open file
     :param length: length of opus file reported by OggOpusInfo
     '''
 
     size = _get_opus_stream_size(fileobj)
-    return int(round((size * 8 / length) / 1000, 1))
+    return int(size * 8.0 / length)
 
 
 # Original mutagen code
