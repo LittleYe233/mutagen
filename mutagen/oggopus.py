@@ -25,6 +25,105 @@ from mutagen._vorbis import VCommentDict
 from mutagen.ogg import OggPage, OggFileType, error as OggError
 
 
+# A workaround to calculate opus bitrate
+# @see https://github.com/quodlibet/mutagen/issues/670#issue-2807751962
+def _read_ogg_page(f):
+    # Read the Ogg page header (27 bytes)
+    header = f.read(27)
+    if len(header) < 27:
+        return None  # End of file or error
+
+    # Unpack the header
+    try:
+        (capture_pattern, version, header_type, granule_position,
+         serial_number, page_sequence_no, checksum, page_segments) = \
+            struct.unpack('<4sBsqIIIB', header)
+    except struct.error:
+        raise ValueError("Not a valid Ogg file")
+
+    # Check for the Ogg capture pattern
+    if capture_pattern != b'OggS' or version != 0:
+        raise ValueError("Not a valid Ogg file")
+
+    # Read the segment table
+    segment_table = f.read(page_segments)
+    if len(segment_table) < page_segments:
+        return None  # End of file or error
+
+    # Read the segment data
+    segment_sizes = [seg for seg in segment_table]
+    body_size = sum(segment_sizes)
+    body = f.read(body_size)
+
+    return {'header': header, 'body': body, 'serial_number': serial_number,
+            'granule_position': granule_position, 'header_type': header_type,
+            'page_sequence_no': page_sequence_no,
+            'page_segments': page_segments}
+
+def _get_opus_stream_size(f):
+    offset = f.tell()
+    f.seek(0)
+    header_count = 0
+    serial = None
+    size = 0
+    last_page_size = None
+    eos = False
+
+    while True:
+        page = _read_ogg_page(f)
+        if page is None:
+            break  # End of file or error
+        # Read pages until first Opus header page (identification header)
+        elif header_count == 0: # Identification header
+            if page['body'][:8] != b'OpusHead':  # Page from other stream?
+                continue
+            else:  # Found it
+                serial = page['serial_number']
+                header_count += 1
+        # Check for expected second Opus header page (comment header)
+        elif header_count == 1 and page['serial_number'] == serial:
+            if page['body'][:8] != b'OpusTags':
+                raise ValueError("Not a valid Opus file")
+            else:
+                header_count += 1
+        # Read pages until first page with audio data
+        elif header_count == 2 and page['serial_number'] == serial:
+            if int.from_bytes(page['header_type'], 'little') & 0x01:
+                continue  # Contiunation of second Opus header page
+            elif page['granule_position'] > 0:  # Found it
+                header_count += 1
+                last_page_size = len(page['body'])
+                size += last_page_size
+        # Read remaining pages with audio data
+        elif page['granule_position'] > 0 and page['serial_number'] == serial:
+            last_page_size = len(page['body'])
+            size += last_page_size
+            # If page is last page (end of stream), we are done
+            if int.from_bytes(page['header_type'], 'little') & 0x04:
+                eos = True
+                break
+
+    # If last page did not contain "end of stream" flag, it was incomplete
+    if not eos:
+        size -= last_page_size
+
+    f.seek(offset)
+
+    return size
+
+
+def _opus_bitrate(fileobj, length: int) -> int:
+    '''Calculate the bitrate of an opus file.
+
+    :param fileobj: object of an open file
+    :param length: length of opus file reported by OggOpusInfo
+    '''
+
+    size = _get_opus_stream_size(fileobj)
+    return int(round((size * 8 / length) / 1000, 1))
+
+
+# Original mutagen code
 class error(OggError):
     pass
 
@@ -41,6 +140,7 @@ class OggOpusInfo(StreamInfo):
     Attributes:
         length (`float`): File length in seconds, as a float
         channels (`int`): Number of channels
+        bitrate (`int`): bitrate in bits per second as an int
     """
 
     length = 0
@@ -72,6 +172,8 @@ class OggOpusInfo(StreamInfo):
         if page is None:
             raise OggOpusHeaderError
         self.length = (page.position - self.__pre_skip) / float(48000)
+        # Inject bitrate calculation
+        self.bitrate = _opus_bitrate(fileobj, self.length)
 
     def pprint(self):
         return u"Ogg Opus, %.2f seconds" % (self.length)
